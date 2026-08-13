@@ -1,4 +1,3 @@
-
 import io
 from datetime import date, timedelta
 import numpy as np
@@ -6,10 +5,10 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-st.set_page_config(page_title="AgroForecast | Pronóstico agrícola", layout="wide")
+st.set_page_config(page_title="AgroForecast | Modelo y Planificador Agrícola", layout="wide")
 
 # ------------------------------------------------------------
-# Utilidades
+# 1. Utilidades y Funciones de Procesamiento de Datos
 # ------------------------------------------------------------
 def clean_name(x):
     return str(x).strip() if pd.notna(x) else ""
@@ -39,17 +38,17 @@ def recency_weight(year, max_year):
 
 def normalize_reference(s):
     s = s.astype(str).str.strip()
-    # El usuario indicó que Fino y Extrafino son el mismo vegetal.
+    # Unificación de Fino y Extrafino
     return s.replace({
         "Extrafino": "Fino",
         "EXTRAFINO": "Fino",
         "extrafino": "Fino",
     })
 
-def read_excel(file):
+def read_excel_data(file="Analisis final.xlsx"):
     raw = pd.read_excel(file, sheet_name=0, header=None)
 
-    # Tabla 6: encabezados en la primera fila útil.
+    # Tabla 6 (Histórico semanal)
     left = raw.iloc[:, 1:14].copy()
     left.columns = [
         "Finca","Lote","Area","Ciclo","Codigo","Vegetal","Referencia",
@@ -61,7 +60,7 @@ def read_excel(file):
         left[c] = pd.to_numeric(left[c], errors="coerce")
     left = left.dropna(subset=["Kilos","Semana","Año","Area"])
 
-    # Tabla 10, si está disponible.
+    # Tabla 10 complementaria
     right = raw.iloc[:, 15:26].copy()
     right.columns = [
         "Finca","Lote","Area","Ciclo","Vegetal","Referencia","CantidadV",
@@ -81,14 +80,13 @@ def prepare_model(t6):
     d["Semana"] = d["Semana"].astype(int)
     d["Año"] = d["Año"].astype(int)
 
-    # Fecha de lunes de la semana ISO. Esto permite cruzar años sin errores.
+    # Fecha de lunes de la semana ISO
     d["SemanaInicio"] = pd.to_datetime(
         d["Año"].astype(str) + "-W" + d["Semana"].astype(str).str.zfill(2) + "-1",
         format="%G-W%V-%u",
         errors="coerce"
     )
 
-    # Un ciclo + vegetal + finca + lote.
     keys = ["Finca","Lote","Ciclo","Referencia"]
     cycles = (
         d.groupby(keys, dropna=False)
@@ -115,9 +113,9 @@ def prepare_model(t6):
         ((d["SemanaInicio"] - d["PrimeraCosecha"]).dt.days / 7) + 1
     ).round().astype(int)
 
-    # Peso de recencia: 50% últimos 2 años, 30% 3-4 años, 20% anteriores.
     max_year = int(d["Año"].max())
     cycles["PesoRecencia"] = cycles["AñoCosecha"].apply(lambda y: recency_weight(y, max_year))
+    cycles["Periodo"] = cycles["AñoCosecha"].apply(lambda y: "2025 y 2026" if y >= 2025 else "<25")
 
     return d, cycles
 
@@ -139,42 +137,56 @@ def cycle_stats(cycles, vegetable=None):
         "max": float(np.max(vals)) if len(vals) else np.nan,
     }
 
-def build_curve(d, vegetable):
+def build_curve_comparative(d, vegetable):
+    """
+    Construye las curvas segmentadas por periodo (<25 vs 2025-2026) y la curva recomendada
+    tal como se solicitó en los requisitos de análisis temporal.
+    """
     x = d[d["Referencia"] == vegetable].copy()
     if x.empty:
-        return pd.DataFrame(columns=["SemanaRelativa","Porcentaje","n"])
-    # Por ciclo: porcentaje de su propia producción total.
+        return pd.DataFrame()
+    
+    x["Periodo"] = x["Año"].apply(lambda y: "2025 y 2026" if y >= 2025 else "<25")
+    
     cyc = (
-        x.groupby(["Finca","Lote","Ciclo","Referencia","SemanaRelativa"], as_index=False)
+        x.groupby(["Periodo","Finca","Lote","Ciclo","Referencia","SemanaRelativa"], as_index=False)
          .agg(Kilos=("Kilos","sum"))
     )
-    total = cyc.groupby(["Finca","Lote","Ciclo","Referencia"])["Kilos"].transform("sum")
+    total = cyc.groupby(["Periodo","Finca","Lote","Ciclo","Referencia"])["Kilos"].transform("sum")
     cyc["Pct"] = cyc["Kilos"] / total.replace(0, np.nan)
 
-    max_year = int(x["Año"].max())
-    cyc["Año"] = x.groupby(["Finca","Lote","Ciclo","Referencia"])["Año"].transform("max").values
-    cyc["Peso"] = cyc["Año"].apply(lambda y: recency_weight(y, max_year))
-
-    out = []
-    for sw, g in cyc.groupby("SemanaRelativa"):
-        out.append({
-            "SemanaRelativa": int(sw),
-            "Porcentaje": weighted_quantile(g["Pct"].values, .50, g["Peso"].values),
-            "P25": weighted_quantile(g["Pct"].values, .25, g["Peso"].values),
-            "P75": weighted_quantile(g["Pct"].values, .75, g["Peso"].values),
-            "n": int(g["Finca"].count())
-        })
-    out = pd.DataFrame(out).sort_values("SemanaRelativa")
-    if not out.empty:
-        out["Porcentaje"] = out["Porcentaje"].clip(lower=0)
-        out["Porcentaje"] = out["Porcentaje"] / out["Porcentaje"].sum()
-    return out
+    # Consolidado por periodo y semana relativa
+    out_periods = []
+    for periodo, gp in cyc.groupby("Periodo"):
+        for sw, g in gp.groupby("SemanaRelativa"):
+            med = float(g["Pct"].median())
+            out_periods.append({"Periodo": periodo, "SemanaRelativa": int(sw), "Porcentaje": med})
+    df_p = pd.DataFrame(out_periods)
+    
+    # Pivoteamos para tener columnas <25 y 2025 y 2026
+    pivot = df_p.pivot(index="SemanaRelativa", columns="Periodo", values="Porcentaje").reset_index()
+    if "<25" not in pivot.columns:
+        pivot["<25"] = 0.0
+    if "2025 y 2026" not in pivot.columns:
+        pivot["2025 y 2026"] = 0.0
+        
+    pivot = pivot.fillna(0)
+    
+    # Curva recomendada (Ponderación 2025-2026 con mayor peso por cambio de duración, ej. brócoli de 4 a 6-7 semanas)
+    # Se da un 70% de peso a 2025 y 2026 y 30% a <25
+    pivot["Recomendada"] = pivot["2025 y 2026"] * 0.70 + pivot["<25"] * 0.30
+    # Normalizar recomendada a suma 1.0
+    s_rec = pivot["Recomendada"].sum()
+    if s_rec > 0:
+        pivot["Recomendada"] = pivot["Recomendada"] / s_rec
+        
+    return pivot
 
 def seasonality(d, vegetable):
     x = d[d["Referencia"] == vegetable].copy()
     if x.empty:
         return pd.DataFrame(columns=["Semana","FactorEstacional"])
-    # Producción por ciclo normalizada por ha y comparada contra el nivel medio del vegetal.
+    
     weekly = (
         x.groupby(["Año","Semana","Finca","Lote","Ciclo","Referencia"], as_index=False)
          .agg(Kilos=("Kilos","sum"), Area=("AreaEfectiva","first"))
@@ -188,23 +200,8 @@ def seasonality(d, vegetable):
         m = np.average(g["KgHa"].dropna(), weights=g.loc[g["KgHa"].notna(),"Peso"]) if g["KgHa"].notna().any() else np.nan
         rows.append((int(wk), m / base if base else 1))
     out = pd.DataFrame(rows, columns=["Semana","FactorEstacional"]).sort_values("Semana")
-    # Suavizado para no sobre-reaccionar a pocas observaciones.
     out["FactorEstacional"] = out["FactorEstacional"].rolling(5, center=True, min_periods=1).mean()
     return out
-
-def trend_factor(cycles, vegetable, target_year):
-    x = cycles[(cycles["Referencia"] == vegetable) & cycles["Rendimiento"].notna()].copy()
-    if len(x) < 4:
-        return 1.0
-    annual = x.groupby("AñoCosecha").agg(Rendimiento=("Rendimiento","median")).reset_index()
-    if len(annual) < 3:
-        return 1.0
-    slope = np.polyfit(annual["AñoCosecha"], annual["Rendimiento"], 1)[0]
-    ref = float(annual["Rendimiento"].median())
-    if ref <= 0:
-        return 1.0
-    f = 1 + (slope / ref) * (target_year - annual["AñoCosecha"].max())
-    return float(np.clip(f, 0.80, 1.20))
 
 def forecast(cycles, d, vegetable, area, first_harvest, scenario):
     stats = cycle_stats(cycles, vegetable)
@@ -218,16 +215,14 @@ def forecast(cycles, d, vegetable, area, first_harvest, scenario):
     else:
         base = stats["median"]
 
-    target_year = first_harvest.year
-    tf = trend_factor(cycles, vegetable, target_year)
-
-    curve = build_curve(d, vegetable)
-    seas = seasonality(d, vegetable)
-    if curve.empty:
+    curve_df = build_curve_comparative(d, vegetable)
+    if curve_df.empty:
         return None, stats, None
 
+    seas = seasonality(d, vegetable)
+    
     rows = []
-    for _, r in curve.iterrows():
+    for _, r in curve_df.iterrows():
         rel = int(r["SemanaRelativa"])
         harvest_date = first_harvest + timedelta(weeks=rel-1)
         iso = harvest_date.isocalendar()
@@ -237,168 +232,206 @@ def forecast(cycles, d, vegetable, area, first_harvest, scenario):
             "Semana relativa": rel,
             "Fecha": harvest_date,
             "Semana año": sw,
-            "Curva base %": r["Porcentaje"],
+            "Curva recomendada %": r["Recomendada"],
             "Factor estacional": sf,
         })
     out = pd.DataFrame(rows)
-    # La estacionalidad redistribuye el total, pero no cambia arbitrariamente el total.
-    out["Peso ajustado"] = out["Curva base %"] * out["Factor estacional"]
-    out["Peso ajustado"] = out["Peso ajustado"] / out["Peso ajustado"].sum()
-    out["Rendimiento proyectado kg/ha"] = base * tf
+    out["Peso ajustado"] = out["Curva recomendada %"] * out["Factor estacional"]
+    s_adj = out["Peso ajustado"].sum()
+    if s_adj > 0:
+        out["Peso ajustado"] = out["Peso ajustado"] / s_adj
+        
+    out["Rendimiento proyectado kg/ha"] = base
     out["Kilos proyectados"] = area * out["Rendimiento proyectado kg/ha"] * out["Peso ajustado"]
 
-    return out, stats, {"trend_factor": tf, "duration": int(curve["SemanaRelativa"].max())}
+    return out, stats, {"duration": int(curve_df["SemanaRelativa"].max())}
 
 # ------------------------------------------------------------
-# Interfaz
+# 2. Interfaz Gráfica Principal (Streamlit)
 # ------------------------------------------------------------
-st.title("🌱 AgroForecast — Rendimiento y Pronóstico Agrícola")
-st.caption("Modelo estadístico agrícola basado en ciclos reales, curvas de cosecha, estacionalidad y tendencia.")
+st.title("🌱 AgroForecast — Modelo Gerencial y Planificador Agrícola")
+st.caption("Análisis histórico comparativo (<2025 vs. 2025-2026), curvas recomendadas y programación de siembras.")
 
 with st.sidebar:
-    st.header("Datos")
-    uploaded = st.file_uploader("Carga tu archivo Excel", type=["xlsx","xls"])
-    st.markdown("**Estructura esperada:** Tabla 6 en las primeras 13 columnas y Tabla 10 en las siguientes 11.")
+    st.header("Fuente de Datos")
+    uploaded = st.file_uploader("Cargar archivo Excel", type=["xlsx","xls"])
+    st.markdown("**Nota:** Si tienes `Analisis final.xlsx` en la misma carpeta, se carga automáticamente.")
     st.divider()
-    st.header("Reglas del modelo")
-    st.write("• Fino + Extrafino → Fino")
+    st.header("Criterios del Modelo")
+    st.write("• Fino + Extrafino unificados")
     st.write("• Área efectiva = Área / Cantidad V")
-    st.write("• Curva por semana relativa")
-    st.write("• Ponderación de recencia: 50% / 30% / 20%")
+    st.write("• Análisis segmentado: <2025 y 2025-2026")
+    st.write("• Curva recomendada ponderada")
 
-source = uploaded if uploaded is not None else None
-
-if source is None:
-    st.info("Carga el archivo histórico para iniciar el análisis.")
-    st.stop()
+source = uploaded if uploaded is not None else "Analisis final.xlsx"
 
 try:
-    t6, t10 = read_excel(source)
+    t6, t10 = read_excel_data(source)
     data, cycles = prepare_model(t6)
 except Exception as e:
-    st.error(f"No se pudo interpretar el Excel: {e}")
+    st.error("No se encontró el archivo 'Analisis final.xlsx'. Por favor, súbelo usando el botón de la barra lateral.")
     st.stop()
 
 vegetables = sorted(data["Referencia"].dropna().unique().tolist())
-st.success(f"Datos cargados: {len(data):,} registros semanales y {len(cycles):,} ciclos.")
+st.success(f"Datos cargados con éxito: {len(data):,} registros y {len(cycles):,} ciclos agrícolas analizados.")
 
-tabs = st.tabs(["📊 Dashboard", "🌾 Vegetal", "📈 Curvas", "🔮 Pronóstico", "🧪 Calidad de datos"])
+tabs = st.tabs([
+    "📊 Dashboard Ejecutivo", 
+    "📈 Curvas & Comparativa Temporal", 
+    "🔮 Pronóstico por Vegetal", 
+    "📋 Planificador de Lotes & Rendimiento", 
+    "🧪 Trazabilidad & Calidad"
+])
 
 with tabs[0]:
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Ciclos", f"{len(cycles):,}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ciclos Totales", f"{len(cycles):,}")
     c2.metric("Vegetales", f"{len(vegetables)}")
-    c3.metric("Años", f"{int(data.Año.min())}–{int(data.Año.max())}")
-    c4.metric("Kilos históricos", f"{data.Kilos.sum():,.0f}")
+    c3.metric("Años Históricos", f"{int(data.Año.min())}–{int(data.Año.max())}")
+    c4.metric("Kilos Históricos", f"{data.Kilos.sum():,.0f}")
 
+    st.subheader("Rendimiento Mediano por Vegetal (kg/ha)")
     ranking = (
         cycles.groupby("Referencia")
         .agg(Rendimiento=("Rendimiento","median"), Ciclos=("Rendimiento","count"))
         .reset_index().sort_values("Rendimiento", ascending=False)
     )
-    st.subheader("Rendimiento mediano por vegetal")
-    st.dataframe(ranking.style.format({"Rendimiento":"{:,.0f}"}), use_container_width=True, hide_index=True)
+    st.dataframe(ranking.style.format({"Rendimiento": "{:,.0f}"}), use_container_width=True, hide_index=True)
 
     fig = px.bar(ranking, x="Referencia", y="Rendimiento", hover_data=["Ciclos"],
-                 labels={"Rendimiento":"kg/ha", "Referencia":"Vegetal"})
+                 labels={"Rendimiento": "Rendimiento Mediano (kg/ha)", "Referencia": "Vegetal"})
     st.plotly_chart(fig, use_container_width=True)
 
 with tabs[1]:
-    veg = st.selectbox("Vegetal", vegetables)
-    stats = cycle_stats(cycles, veg)
-    curve = build_curve(data, veg)
-    seas = seasonality(data, veg)
+    st.subheader("Análisis de Curvas: Histórico (<2025) vs. Reciente (2025-2026) y Recomendada")
+    veg_c = st.selectbox("Seleccione Vegetal para Curva", vegetables, key="curv_veg")
+    
+    curve_comp = build_curve_comparative(data, veg_c)
+    if curve_comp.empty:
+        st.warning("No hay suficientes datos para este vegetal.")
+    else:
+        # Mostrar tabla resumen estilo pestaña necesidades
+        st.markdown(f"**Comparativa de distribución porcentual de cosecha para: {veg_c}**")
+        display_tbl = curve_comp.copy()
+        for col in ["<25", "2025 y 2026", "Recomendada"]:
+            if col in display_tbl.columns:
+                display_tbl[col] = display_tbl[col].map(lambda x: f"{x:.1%}")
+        st.dataframe(display_tbl.rename(columns={"SemanaRelativa": "Semana de Cosecha"}), use_container_width=True, hide_index=True)
 
-    a,b,c,d1,e = st.columns(5)
-    a.metric("Ciclos", stats["n"])
-    b.metric("P25", f'{stats["p25"]:,.0f} kg/ha')
-    c.metric("Mediana", f'{stats["median"]:,.0f} kg/ha')
-    d1.metric("P75", f'{stats["p75"]:,.0f} kg/ha')
-    e.metric("Máximo", f'{stats["max"]:,.0f} kg/ha')
-
-    dur = cycles[cycles["Referencia"]==veg]["DuracionReal"]
-    st.write(f"**Duración real:** mediana {dur.median():.0f} semanas | promedio {dur.mean():.1f} semanas | reciente (últimos 2 años) {dur[cycles.loc[cycles['Referencia']==veg,'AñoCosecha'] >= cycles['AñoCosecha'].max()-2].median():.0f} semanas.")
-
-    col1,col2 = st.columns(2)
-    with col1:
-        st.subheader("Distribución de rendimiento")
-        fig = px.histogram(cycles[cycles["Referencia"]==veg], x="Rendimiento", nbins=30, labels={"Rendimiento":"kg/ha"})
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.subheader("Tendencia anual")
-        annual = cycles[cycles["Referencia"]==veg].groupby("AñoCosecha")["Rendimiento"].median().reset_index()
-        fig = px.line(annual, x="AñoCosecha", y="Rendimiento", markers=True, labels={"Rendimiento":"kg/ha","AñoCosecha":"Año"})
-        st.plotly_chart(fig, use_container_width=True)
+        # Gráfico comparativo
+        fig_c = px.line(
+            curve_comp.melt(id_vars=["SemanaRelativa"], value_vars=["<25", "2025 y 2026", "Recomendada"], 
+                            var_name="Periodo / Modelo", value_name="Porcentaje"),
+            x="SemanaRelativa", y="Porcentaje", color="Periodo / Modelo", markers=True,
+            labels={"SemanaRelativa": "Semana de Cosecha Relativa", "Porcentaje": "Porcentaje de Cosecha"}
+        )
+        fig_c.update_yaxes(tickformat=".0%")
+        st.plotly_chart(fig_c, use_container_width=True)
 
 with tabs[2]:
-    veg = st.selectbox("Vegetal para curva", vegetables, key="curveveg")
-    curve = build_curve(data, veg)
-    st.subheader(f"Curva de producción — {veg}")
-    if curve.empty:
-        st.warning("No hay suficientes datos.")
-    else:
-        fig = px.line(curve, x="SemanaRelativa", y="Porcentaje", markers=True,
-                      labels={"SemanaRelativa":"Semana relativa de cosecha","Porcentaje":"% del total"})
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
-        show = curve.copy()
-        show["Porcentaje"] = show["Porcentaje"].map(lambda x: f"{x:.1%}")
-        st.dataframe(show.rename(columns={"SemanaRelativa":"Semana","Porcentaje":"Curva recomendada","P25":"P25","P75":"P75"}), use_container_width=True, hide_index=True)
-
-        st.subheader("Estacionalidad por semana del año")
-        seas = seasonality(data, veg)
-        fig2 = px.line(seas, x="Semana", y="FactorEstacional", markers=True,
-                       labels={"FactorEstacional":"Índice estacional"})
-        fig2.add_hline(y=1, line_dash="dash")
-        st.plotly_chart(fig2, use_container_width=True)
-
-with tabs[3]:
-    st.subheader("Motor de pronóstico")
-    col1,col2,col3 = st.columns(3)
+    st.subheader("Motor de Pronóstico y Rendimiento Futuro")
+    col1, col2, col3 = st.columns(3)
     vegf = col1.selectbox("Vegetal", vegetables, key="forecastveg")
-    area = col2.number_input("Área (ha)", min_value=0.01, value=1.0, step=0.1)
-    first_harvest = col3.date_input("Fecha estimada de primera cosecha", value=date.today())
+    area = col2.number_input("Área del Lote (ha)", min_value=0.01, value=1.0, step=0.1)
+    first_harvest = col3.date_input("Fecha Estimada de Primera Cosecha", value=date.today())
 
-    st.caption("Importante: tu histórico no contiene fecha de siembra. Por eso la primera versión pronostica desde la **fecha de primera cosecha**. Cuando agreguemos Fecha Siembra al histórico, el sistema podrá aprender automáticamente los días siembra→primera cosecha por vegetal.")
-
-    scenario = st.radio("Escenario", ["Conservador","Probable","Optimista"], horizontal=True)
-    result, stats, meta = forecast(cycles, data, vegf, area, first_harvest, scenario)
+    scenario = st.radio("Escenario de Rendimiento", ["Conservador (P25)", "Probable (Mediana)", "Optimista (P75)"], horizontal=True)
+    sc_map = {"Conservador (P25)": "Conservador", "Probable (Mediana)": "Probable", "Optimista (P75)": "Optimista"}
+    
+    result, stats, meta = forecast(cycles, data, vegf, area, first_harvest, sc_map[scenario])
 
     if result is not None:
-        total = result["Kilos proyectados"].sum()
-        rendimiento = result["Rendimiento proyectado kg/ha"].iloc[0]
-        dur = result["Semana relativa"].max()
+        total_kilos = result["Kilos proyectados"].sum()
+        rend_ha = result["Rendimiento proyectado kg/ha"].iloc[0]
+        dur_sem = result["Semana relativa"].max()
 
-        a,b,c = st.columns(3)
-        a.metric("Producción total", f"{total:,.0f} kg")
-        b.metric("Rendimiento", f"{rendimiento:,.0f} kg/ha")
-        c.metric("Duración esperada", f"{dur} semanas")
+        a, b, c = st.columns(3)
+        a.metric("Producción Total Estimada", f"{total_kilos:,.0f} kg")
+        b.metric("Rendimiento Proyectado", f"{rend_ha:,.0f} kg/ha")
+        c.metric("Duración de Cosecha", f"{dur_sem} semanas")
 
-        st.dataframe(
-            result[["Semana relativa","Fecha","Semana año","Peso ajustado","Kilos proyectados"]]
-            .rename(columns={"Peso ajustado":"% proyectado"}),
-            use_container_width=True, hide_index=True
-        )
-        fig = px.bar(result, x="Fecha", y="Kilos proyectados",
-                     labels={"Kilos proyectados":"kg proyectados","Fecha":"Semana de cosecha"})
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("**Desglose Semanal del Pronóstico**")
+        show_res = result.copy()
+        show_res["Curva recomendada %"] = show_res["Curva recomendada %"].map(lambda x: f"{x:.1%}")
+        show_res["Peso ajustado"] = show_res["Peso ajustado"].map(lambda x: f"{x:.1%}")
+        show_res["Kilos proyectados"] = show_res["Kilos proyectados"].map(lambda x: f"{x:,.0f} kg")
+        st.dataframe(show_res, use_container_width=True, hide_index=True)
 
-        csv = result.to_csv(index=False).encode("utf-8")
-        st.download_button("Descargar pronóstico CSV", csv, "pronostico_agroforecast.csv", "text/csv")
+        fig_p = px.bar(result, x="Fecha", y="Kilos proyectados",
+                       labels={"Kilos proyectados": "Kilos Proyectados", "Fecha": "Semana de Cosecha"})
+        st.plotly_chart(fig_p, use_container_width=True)
+
+        csv_data = result.to_csv(index=False).encode("utf-8")
+        st.download_button("Descargar Pronóstico en CSV", csv_data, f"pronostico_{vegf}.csv", "text/csv")
     else:
-        st.warning("No hay suficiente histórico para ese vegetal.")
+        st.warning("No hay suficiente histórico para generar el pronóstico de este vegetal.")
+
+with tabs[3]:
+    st.subheader("Planificador de Lotes y Programación de Cosecha")
+    st.markdown("Simula la programación de siembras multiplicando el **Área del Lote × Porcentaje de la Curva Recomendada × Rendimiento Plan**.")
+    
+    col_l1, col_l2, col_l3 = st.columns(3)
+    finca_sel = col_l1.selectbox("Finca", sorted(data["Finca"].dropna().unique()))
+    lotes_disponibles = sorted(data[data["Finca"] == finca_sel]["Lote"].dropna().unique())
+    lote_sel = col_l2.selectbox("Lote", lotes_disponibles)
+    
+    # Obtener área promedio del lote
+    lote_data = data[(data["Finca"] == finca_sel) & (data["Lote"] == lote_sel)]
+    default_area = float(lote_data["AreaEfectiva"].mean()) if not lote_data.empty else 1.0
+    area_lote = col_l3.number_input("Área del Lote (ha)", min_value=0.01, value=default_area, step=0.1)
+
+    veg_plan = st.selectbox("Vegetal a Programar", vegetables, key="plan_veg")
+    rend_plan = st.number_input("Rendimiento Plan (kg/ha)", min_value=100.0, value=10900.0, step=500.0)
+    siembra_date = st.date_input("Fecha de Siembra / Inicio Cosecha", value=date.today())
+
+    # Generar tabla de plan
+    curve_p = build_curve_comparative(data, veg_plan)
+    if not curve_p.empty:
+        plan_rows = []
+        for _, row in curve_p.iterrows():
+            sem_rel = int(row["SemanaRelativa"])
+            pct = row["Recomendada"]
+            sem_date = siembra_date + timedelta(weeks=sem_rel-1)
+            kilos_plan = area_lote * pct * rend_plan
+            plan_rows.append({
+                "Semana de Cosecha": sem_rel,
+                "Fecha": sem_date,
+                "Curva Recomendada %": pct,
+                "Área Lote (ha)": area_lote,
+                "Rendimiento Plan (kg/ha)": rend_plan,
+                "Kilos Programados": kilos_plan
+            })
+        df_plan = pd.DataFrame(plan_rows)
+        
+        # Mostrar resumen superior
+        tot_plan_kilos = df_plan["Kilos Programados"].sum()
+        a, b = st.columns(2)
+        a.metric("Producción Total Programada", f"{tot_plan_kilos:,.0f} kg")
+        b.metric("Duración del Ciclo Planificado", f"{len(df_plan)} semanas")
+
+        # Tabla formateada
+        show_plan = df_plan.copy()
+        show_plan["Curva Recomendada %"] = show_plan["Curva Recomendada %"].map(lambda x: f"{x:.1%}")
+        show_plan["Kilos Programados"] = show_plan["Kilos Programados"].map(lambda x: f"{x:,.0f}")
+        st.dataframe(show_plan, use_container_width=True, hide_index=True)
+
+        fig_plan = px.bar(df_plan, x="Fecha", y="Kilos Programados",
+                          title=f"Programación de Cosecha — Finca: {finca_sel} | Lote: {lote_sel} ({veg_plan})",
+                          labels={"Kilos Programados": "Kilos", "Fecha": "Semana"})
+        st.plotly_chart(fig_plan, use_container_width=True)
+    else:
+        st.warning("No hay datos de curva suficientes para este vegetal.")
 
 with tabs[4]:
-    st.subheader("Calidad y trazabilidad de datos")
-    st.write("El modelo usa la Tabla 6 como fuente principal y recalcula el rendimiento por ciclo.")
-    q1 = data["Kilos"].isna().sum()
-    q2 = data["Area"].isna().sum()
-    q3 = data["SemanaInicio"].isna().sum()
-    st.metric("Registros con semana/fecha no interpretable", int(q3))
-    st.metric("Registros con kilos faltantes", int(q1))
-    st.metric("Registros con área faltante", int(q2))
+    st.subheader("Auditoría de Calidad y Trazabilidad de Datos")
+    q_kilos = data["Kilos"].isna().sum()
+    q_area = data["Area"].isna().sum()
+    q_date = data["SemanaInicio"].isna().sum()
+    
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Registros sin Fecha Válida", int(q_date))
+    col_b.metric("Registros sin Kilos", int(q_kilos))
+    col_c.metric("Registros sin Área", int(q_area))
 
-    st.info(
-        "Siguiente mejora recomendada: agregar Fecha de Siembra, Fecha de Primera Cosecha y variedad real. "
-        "Con esas tres variables el modelo podrá aprender el tiempo siembra→cosecha y separar mejor efectos de lote, época y variedad."
-    )
+    st.markdown("**Resumen de Ciclos Analizados**")
+    st.dataframe(cycles[["Finca", "Lote", "Ciclo", "Referencia", "Area", "TotalKilos", "Rendimiento", "DuracionReal", "AñoCosecha", "Periodo"]].head(50), use_container_width=True, hide_index=True)
