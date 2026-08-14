@@ -116,7 +116,6 @@ def read_excel(file):
          "Kilos", "Semana", "Año", "Mes"]
     )
 
-    # Solamente eliminamos filas que no pueden representar una cosecha.
     left = left[
         left["Finca"].ne("nan")
         & left["Lote"].ne("nan")
@@ -204,6 +203,19 @@ def prepare_model(t6):
         cycles["Area"].replace(0, np.nan)
     )
 
+    # Detección robusta de atípicos por IQR en la duración real por vegetal
+    cycles["Atipico"] = False
+    for veg, group in cycles.groupby("Referencia"):
+        dur = group["DuracionReal"].dropna()
+        if len(dur) >= 4:
+            q1 = dur.quantile(0.25)
+            q3 = dur.quantile(0.75)
+            iqr = q3 - q1
+            low = q1 - 1.5 * iqr
+            high = q3 + 1.5 * iqr
+            idx = group[(group["DuracionReal"] < low) | (group["DuracionReal"] > high)].index
+            cycles.loc[idx, "Atipico"] = True
+
     max_year = int(d["Año"].max())
     cycles["PesoRecencia"] = cycles["AñoCosecha"].apply(
         lambda y: recency_weight(y, max_year)
@@ -218,6 +230,7 @@ def prepare_model(t6):
                 "Rendimiento",
                 "AñoCosecha",
                 "PesoRecencia",
+                "Atipico"
             ]
         ],
         on=keys,
@@ -238,7 +251,7 @@ def prepare_model(t6):
 
 
 # ============================================================
-# ESTADÍSTICA DE RENDIMIENTO
+# ESTADÍSTICA DE RENDIMIENTO (EXCLUYENDO ATÍPICOS)
 # ============================================================
 def period_label(year, max_year):
     age = max_year - year
@@ -250,8 +263,10 @@ def period_label(year, max_year):
 
 
 def yield_stats(cycles, vegetable):
+    # Excluimos atípicos para limpiar las estadísticas
     x = cycles[
         (cycles["Referencia"] == vegetable)
+        & (~cycles["Atipico"])
         & cycles["Rendimiento"].notna()
         & (cycles["Rendimiento"] > 0)
     ].copy()
@@ -278,7 +293,6 @@ def yield_stats(cycles, vegetable):
     recent_median = float(recent["Rendimiento"].median()) if not recent.empty else np.nan
     historical_median = float(old["Rendimiento"].median()) if not old.empty else np.nan
 
-    # Tendencia anual mediante medianas por año.
     annual = (
         x.groupby("AñoCosecha", as_index=False)["Rendimiento"]
         .median()
@@ -300,7 +314,6 @@ def yield_stats(cycles, vegetable):
             )
         )
 
-    # Recomendación estable: mediana ponderada + tendencia limitada.
     recommended = wmean * (1 + trend_pct)
     recommended = float(
         np.clip(
@@ -326,10 +339,11 @@ def yield_stats(cycles, vegetable):
 
 
 # ============================================================
-# CURVAS
+# CURVAS (EXCLUYENDO ATÍPICOS)
 # ============================================================
 def cycle_curve_data(d, vegetable):
-    x = d[d["Referencia"] == vegetable].copy()
+    # Excluimos registros pertenecientes a ciclos atípicos
+    x = d[(d["Referencia"] == vegetable) & (~d["Atipico"])].copy()
     if x.empty:
         return pd.DataFrame()
 
@@ -380,7 +394,6 @@ def recommended_curve(d, vegetable):
     if weekly.empty:
         return pd.DataFrame()
 
-    # Mediana por semana relativa ponderada por recencia.
     rows = []
     for week, g in weekly.groupby("SemanaRelativa"):
         rows.append({
@@ -399,11 +412,8 @@ def recommended_curve(d, vegetable):
         })
 
     out = pd.DataFrame(rows).sort_values("Semana")
-
-    # La curva recomendada usa la mediana ponderada por recencia.
     out["Recomendado"] = out["P50"].clip(lower=0)
 
-    # Normalización: la curva siempre debe sumar 100%.
     total = out["Recomendado"].sum()
     if total > 0:
         out["Recomendado"] /= total
@@ -415,7 +425,7 @@ def recommended_curve(d, vegetable):
 
 
 # ============================================================
-# DURACIÓN RECOMENDADA Y ATÍPICOS
+# DURACIÓN RECOMENDADA Y ANÁLISIS DE ATÍPICOS
 # ============================================================
 def duration_analysis(cycles, vegetable):
     x = cycles[
@@ -428,71 +438,46 @@ def duration_analysis(cycles, vegetable):
         return None
 
     max_year = int(cycles["AñoCosecha"].max())
-    recent = x[x["AñoCosecha"] >= max_year - RECENT_YEARS]
+    
+    # Subconjunto sin atípicos para calcular la duración esperada limpia
+    clean_x = x[~x["Atipico"]].copy()
+    recent_clean = clean_x[clean_x["AñoCosecha"] >= max_year - RECENT_YEARS]
 
-    q1 = x["DuracionReal"].quantile(.25)
-    q3 = x["DuracionReal"].quantile(.75)
-    iqr = q3 - q1
-    low = q1 - 1.5 * iqr
-    high = q3 + 1.5 * iqr
+    historical_mode = int(clean_x["DuracionReal"].mode().iloc[0]) if not clean_x.empty else int(round(x["DuracionReal"].median()))
+    recent_mode = int(recent_clean["DuracionReal"].mode().iloc[0]) if not recent_clean.empty else historical_mode
 
-    x["Atipico"] = (
-        (x["DuracionReal"] < low)
-        | (x["DuracionReal"] > high)
-    )
-
-    # Moda histórica y moda reciente.
-    mode_all = x["DuracionReal"].mode()
-    mode_recent = recent["DuracionReal"].mode()
-
-    historical_mode = int(mode_all.iloc[0]) if len(mode_all) else int(round(x["DuracionReal"].median()))
-    recent_mode = int(mode_recent.iloc[0]) if len(mode_recent) else historical_mode
-
-    # Evidencia de cambio:
-    # reciente debe tener al menos 3 ciclos y diferir de la moda histórica.
-    recent_n = len(recent)
+    recommended = historical_mode
+    recent_n = len(recent_clean)
+    
     if recent_n >= 3 and recent_mode != historical_mode:
-        # Si la moda reciente domina claramente dentro del periodo reciente,
-        # adoptamos la nueva duración.
-        counts = recent["DuracionReal"].value_counts()
+        counts = recent_clean["DuracionReal"].value_counts()
         share = counts.get(recent_mode, 0) / recent_n
         if share >= 0.35:
             recommended = recent_mode
-            reason = "Cambio reciente consistente"
+            reason = "Cambio reciente consistente (sin atípicos)"
         else:
-            recommended = historical_mode
-            reason = "Cambio reciente insuficiente"
+            reason = "Comportamiento histórico dominante"
     else:
-        recommended = historical_mode
         reason = "Comportamiento histórico dominante"
 
-    # Si la mediana reciente es claramente mayor y hay suficientes ciclos,
-    # permitimos capturar una transición aunque no haya moda perfecta.
     if recent_n >= 5:
-        recent_median = int(round(recent["DuracionReal"].median()))
+        recent_median = int(round(recent_clean["DuracionReal"].median()))
         if recent_median > historical_mode:
-            share_long = (
-                (recent["DuracionReal"] >= recent_median).mean()
-            )
+            share_long = (recent_clean["DuracionReal"] >= recent_median).mean()
             if share_long >= 0.50:
                 recommended = recent_median
                 reason = "Transición reciente confirmada"
 
-    confidence = "Baja"
-    if len(x) >= 20:
-        confidence = "Alta"
-    elif len(x) >= 8:
-        confidence = "Media"
-
+    confidence = "Alta" if len(clean_x) >= 20 else ("Media" if len(clean_x) >= 8 else "Baja")
     if recent_n < 3:
         confidence = "Baja"
 
     return {
-        "n": len(x),
+        "n": len(clean_x),
         "historical_mode": historical_mode,
         "recent_mode": recent_mode,
-        "historical_median": float(x["DuracionReal"].median()),
-        "recent_median": float(recent["DuracionReal"].median()) if not recent.empty else np.nan,
+        "historical_median": float(clean_x["DuracionReal"].median()),
+        "recent_median": float(recent_clean["DuracionReal"].median()) if not recent_clean.empty else np.nan,
         "recommended": int(recommended),
         "atypical": int(x["Atipico"].sum()),
         "recent_n": recent_n,
@@ -503,10 +488,11 @@ def duration_analysis(cycles, vegetable):
 
 
 # ============================================================
-# ESTACIONALIDAD Y TENDENCIA
+# ESTACIONALIDAD (EXCLUYENDO ATÍPICOS)
 # ============================================================
 def seasonality(d, vegetable):
-    x = d[d["Referencia"] == vegetable].copy()
+    # Filtramos también registros atípicos
+    x = d[(d["Referencia"] == vegetable) & (~d["Atipico"])].copy()
     if x.empty:
         return pd.DataFrame(columns=["Semana", "FactorEstacional"])
 
@@ -621,7 +607,6 @@ def forecast(cycles, d, vegetable, area, first_harvest, scenario):
     else:
         base = ys["recommended"]
 
-    # Limitar curva a la duración recomendada y renormalizar.
     curve = curve[curve["Semana"] <= ds["recommended"]].copy()
     if curve.empty:
         return None, None
@@ -653,8 +638,6 @@ def forecast(cycles, d, vegetable, area, first_harvest, scenario):
         })
 
     out = pd.DataFrame(rows)
-
-    # El factor estacional redistribuye la curva sin inflar el total.
     out["Peso ajustado"] = (
         out["Curva recomendada"] *
         out["Factor estacional"]
@@ -683,8 +666,8 @@ def forecast(cycles, d, vegetable, area, first_harvest, scenario):
 # ============================================================
 st.title("🌱 AgroForecast — Rendimiento y Pronóstico Agrícola")
 st.caption(
-    "Motor estadístico para rendimiento, duración, curvas, estacionalidad "
-    "y planificación agrícola."
+    "Motor estadístico con exclusión automática de ciclos atípicos "
+    "para rendimiento, duración, curvas y estacionalidad."
 )
 
 with st.sidebar:
@@ -703,8 +686,7 @@ with st.sidebar:
     st.write("• Fino + Extrafino → Fino")
     st.write("• Área efectiva = Área / Cantidad V")
     st.write("• Curva por semana relativa")
-    st.write("• Recencia: 50% / 30% / 20%")
-    st.write("• Atípicos se identifican, no se eliminan automáticamente.")
+    st.write("• Exclusión automática de atípicos (> 1.5 IQR)")
 
 if uploaded is None:
     st.info("Carga el archivo histórico para iniciar el análisis.")
@@ -754,8 +736,10 @@ with tabs[0]:
     c3.metric("Años", f"{min_year}–{max_year}")
     c4.metric("Kilos históricos", f"{data.Kilos.sum():,.0f}")
 
+    # Ranking usando ciclos limpios sin atípicos
+    clean_cycles_all = cycles[~cycles["Atipico"]]
     ranking = (
-        cycles.groupby("Referencia")
+        clean_cycles_all.groupby("Referencia")
         .agg(
             Rendimiento=("Rendimiento", "median"),
             Ciclos=("Rendimiento", "count")
@@ -764,7 +748,7 @@ with tabs[0]:
         .sort_values("Rendimiento", ascending=False)
     )
 
-    st.subheader("Rendimiento mediano por vegetal")
+    st.subheader("Rendimiento mediano por vegetal (Excluyendo atípicos)")
     st.dataframe(
         ranking.style.format({"Rendimiento": "{:,.0f}"}),
         use_container_width=True,
@@ -794,18 +778,19 @@ with tabs[1]:
     curve = recommended_curve(data, veg)
 
     a, b, c, d1, e = st.columns(5)
-    a.metric("Ciclos", ys["n"])
-    b.metric("P25", f'{ys["p25"]:,.0f} kg/ha')
-    c.metric("P50", f'{ys["p50"]:,.0f} kg/ha')
-    d1.metric("P75", f'{ys["p75"]:,.0f} kg/ha')
-    e.metric("Recomendado", f'{ys["recommended"]:,.0f} kg/ha')
+    a.metric("Ciclos limpios", ys["n"] if ys else 0)
+    b.metric("P25", f'{ys["p25"]:,.0f} kg/ha' if ys else "—")
+    c.metric("P50", f'{ys["p50"]:,.0f} kg/ha' if ys else "—")
+    d1.metric("P75", f'{ys["p75"]:,.0f} kg/ha' if ys else "—")
+    e.metric("Recomendado", f'{ys["recommended"]:,.0f} kg/ha' if ys else "—")
 
-    st.subheader("Rendimiento")
-    st.write(
-        f"Histórico: **{ys['historical_median']:,.0f} kg/ha** | "
-        f"Reciente: **{ys['recent_median']:,.0f} kg/ha** | "
-        f"Tendencia: **{ys['trend_pct']:.1%}**"
-    )
+    if ys:
+        st.subheader("Rendimiento")
+        st.write(
+            f"Histórico: **{ys['historical_median']:,.0f} kg/ha** | "
+            f"Reciente: **{ys['recent_median']:,.0f} kg/ha** | "
+            f"Tendencia: **{ys['trend_pct']:.1%}**"
+        )
 
     st.subheader("Duración real de cosecha")
     if ds:
@@ -813,42 +798,37 @@ with tabs[1]:
         a.metric("Histórica", f"{ds['historical_mode']} semanas")
         b.metric("Reciente", f"{ds['recent_mode']} semanas")
         c.metric("Recomendada", f"{ds['recommended']} semanas")
-        d1.metric("Confianza", ds["confidence"])
+        d1.metric("Atípicos excluidos", ds["atypical"])
         st.info(
-            f"{ds['reason']}. Ciclos analizados: {ds['n']}. "
-            f"Ciclos recientes: {ds['recent_n']}. "
-            f"Ciclos atípicos detectados: {ds['atypical']}."
+            f"{ds['reason']}. Ciclos limpios analizados: {ds['n']}. "
+            f"Confianza: {ds['confidence']}."
         )
 
-    col1, col2 = st.columns(2)
+    if ys:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Tendencia anual")
+            fig = px.line(
+                ys["annual"],
+                x="AñoCosecha",
+                y="Rendimiento",
+                markers=True,
+                labels={"Rendimiento": "kg/ha", "AñoCosecha": "Año"}
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-    with col1:
-        st.subheader("Tendencia anual")
-        annual = ys["annual"]
-        fig = px.line(
-            annual,
-            x="AñoCosecha",
-            y="Rendimiento",
-            markers=True,
-            labels={
-                "Rendimiento": "kg/ha",
-                "AñoCosecha": "Año"
-            }
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        st.subheader("Distribución de rendimiento")
-        fig = px.histogram(
-            ys["cycles"],
-            x="Rendimiento",
-            nbins=30,
-            labels={"Rendimiento": "kg/ha"}
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.subheader("Distribución de rendimiento (Limpio)")
+            fig = px.histogram(
+                ys["cycles"],
+                x="Rendimiento",
+                nbins=30,
+                labels={"Rendimiento": "kg/ha"}
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
     if ds:
-        st.subheader("Ciclos y detección de atípicos")
+        st.subheader("Listado de ciclos y detección de atípicos")
         detail = ds["detail"][
             [
                 "Finca", "Lote", "Ciclo",
@@ -906,7 +886,7 @@ with tabs[2]:
             hide_index=True
         )
 
-        st.subheader("Estacionalidad por semana del año")
+        st.subheader("Estacionalidad por semana del año (Excluyendo atípicos)")
         seas = seasonality(data, veg)
         if not seas.empty:
             fig2 = px.line(
@@ -925,10 +905,7 @@ with tabs[2]:
 # ============================================================
 with tabs[3]:
     st.subheader("🧠 Motor de recomendación — Necesidades")
-    st.caption(
-        "Los valores son calculados desde el histórico real. "
-        "Los datos de la hoja Necesidades del archivo de ejemplo no se copian."
-    )
+    st.caption("Cálculos limpios excluyendo ciclos con duraciones atípicas extremas.")
 
     necesidades = build_necesidades(data, cycles)
 
@@ -966,41 +943,6 @@ with tabs[3]:
             "text/csv"
         )
 
-        vegn = st.selectbox(
-            "Ver detalle del vegetal",
-            necesidades["Vegetal"].tolist(),
-            key="necesidadveg"
-        )
-
-        detail = necesidades[
-            necesidades["Vegetal"] == vegn
-        ].iloc[0]
-
-        st.subheader(f"Recomendación: {vegn}")
-
-        a, b, c, d1 = st.columns(4)
-        a.metric(
-            "Rendimiento recomendado",
-            f"{detail['Rend. recomendado']:,.0f} kg/ha"
-        )
-        b.metric(
-            "Duración recomendada",
-            f"{int(detail['Duración recomendada'])} semanas"
-        )
-        c.metric(
-            "Confianza duración",
-            detail["Confianza duración"]
-        )
-        d1.metric(
-            "Ciclos atípicos",
-            int(detail["Ciclos atípicos"])
-        )
-
-        st.write(
-            f"**Motivo:** {detail['Motivo duración']}. "
-            f"**Tendencia:** {detail['Tendencia %']:.1%}."
-        )
-
 
 # ============================================================
 # PRONÓSTICO
@@ -1009,27 +951,9 @@ with tabs[4]:
     st.subheader("🔮 Motor de pronóstico")
 
     col1, col2, col3 = st.columns(3)
-    vegf = col1.selectbox(
-        "Vegetal",
-        vegetables,
-        key="forecastveg"
-    )
-    area = col2.number_input(
-        "Área (ha)",
-        min_value=0.01,
-        value=1.0,
-        step=0.1
-    )
-    first_harvest = col3.date_input(
-        "Fecha estimada de primera cosecha",
-        value=date.today()
-    )
-
-    st.caption(
-        "Actualmente se pronostica desde la primera cosecha. "
-        "Cuando el histórico tenga Fecha de Siembra, el modelo podrá "
-        "aprender automáticamente el intervalo siembra → primera cosecha."
-    )
+    vegf = col1.selectbox("Vegetal", vegetables, key="forecastveg")
+    area = col2.number_input("Área (ha)", min_value=0.01, value=1.0, step=0.1)
+    first_harvest = col3.date_input("Fecha estimada de primera cosecha", value=date.today())
 
     scenario = st.radio(
         "Escenario",
@@ -1050,24 +974,10 @@ with tabs[4]:
         total = result["Kilos proyectados"].sum()
 
         a, b, c, d1 = st.columns(4)
-        a.metric(
-            "Producción total",
-            f"{total:,.0f} kg"
-        )
-        b.metric(
-            "Rendimiento plan",
-            f"{meta['rendimiento']:,.0f} kg/ha"
-        )
-        c.metric(
-            "Duración",
-            f"{meta['duracion']} semanas"
-        )
-        d1.metric(
-            "Confianza",
-            meta["confianza"]
-        )
-
-        st.info(f"**Criterio de duración:** {meta['motivo_duracion']}.")
+        a.metric("Producción total", f"{total:,.0f} kg")
+        b.metric("Rendimiento plan", f"{meta['rendimiento']:,.0f} kg/ha")
+        c.metric("Duración limpia", f"{meta['duracion']} semanas")
+        d1.metric("Confianza", meta["confianza"])
 
         show = result[
             [
@@ -1082,24 +992,15 @@ with tabs[4]:
         ].copy()
 
         for col in ["Curva recomendada", "Peso ajustado"]:
-            show[col] = show[col].map(
-                lambda x: f"{x:.1%}"
-            )
+            show[col] = show[col].map(lambda x: f"{x:.1%}")
 
-        st.dataframe(
-            show,
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
         fig = px.bar(
             result,
             x="Fecha",
             y="Kilos proyectados",
-            labels={
-                "Kilos proyectados": "kg proyectados",
-                "Fecha": "Semana de cosecha"
-            }
+            labels={"Kilos proyectados": "kg proyectados", "Fecha": "Semana de cosecha"}
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1110,9 +1011,7 @@ with tabs[4]:
             "text/csv"
         )
     else:
-        st.warning(
-            "No hay suficiente histórico para generar un pronóstico."
-        )
+        st.warning("No hay suficiente histórico limpio para generar un pronóstico.")
 
 
 # ============================================================
@@ -1121,11 +1020,7 @@ with tabs[4]:
 with tabs[5]:
     st.subheader("🗓️ Plan — rendimiento editable")
 
-    vegp = st.selectbox(
-        "Vegetal",
-        vegetables,
-        key="planveg"
-    )
+    vegp = st.selectbox("Vegetal", vegetables, key="planveg")
     ys = yield_stats(cycles, vegp)
     ds = duration_analysis(cycles, vegp)
     curve = recommended_curve(data, vegp)
@@ -1139,25 +1034,11 @@ with tabs[5]:
             "Rendimiento plan kg/ha",
             min_value=0.0,
             value=default_yield,
-            step=100.0,
-            help=(
-                "El modelo propone el rendimiento recomendado, "
-                "pero puedes modificarlo manualmente."
-            )
+            step=100.0
         )
 
-        st.write(
-            f"Rendimiento recomendado por el modelo: "
-            f"**{default_yield:,.0f} kg/ha**"
-        )
-
-        plan_curve = curve[
-            curve["Semana"] <= ds["recommended"]
-        ].copy()
-
-        plan_curve["Curva plan"] = (
-            plan_curve["Recomendado"].clip(lower=0)
-        )
+        plan_curve = curve[curve["Semana"] <= ds["recommended"]].copy()
+        plan_curve["Curva plan"] = plan_curve["Recomendado"].clip(lower=0)
         plan_curve["Curva plan"] /= plan_curve["Curva plan"].sum()
 
         plan_curve["Rendimiento plan kg/ha"] = plan_yield
@@ -1166,59 +1047,26 @@ with tabs[5]:
             plan_curve["Curva plan"]
         )
 
-        st.write(
-            f"Duración recomendada: **{ds['recommended']} semanas**"
-        )
-
         display = plan_curve[
-            [
-                "Semana",
-                "Curva plan",
-                "Rendimiento plan kg/ha",
-                "Producción kg/ha"
-            ]
+            ["Semana", "Curva plan", "Rendimiento plan kg/ha", "Producción kg/ha"]
         ].copy()
+        display["Curva plan"] = display["Curva plan"].map(lambda x: f"{x:.1%}")
 
-        display["Curva plan"] = display["Curva plan"].map(
-            lambda x: f"{x:.1%}"
-        )
-
-        st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.metric(
-            "Total rendimiento plan",
-            f"{plan_curve['Producción kg/ha'].sum():,.0f} kg/ha"
-        )
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.metric("Total rendimiento plan", f"{plan_curve['Producción kg/ha'].sum():,.0f} kg/ha")
 
 
 # ============================================================
 # CALIDAD
 # ============================================================
 with tabs[6]:
-    st.subheader("🧪 Calidad y trazabilidad")
+    st.subheader("🧪 Calidad y trazabilidad de atípicos")
 
-    invalid_dates = int(data["SemanaInicio"].isna().sum())
-    missing_kilos = int(data["Kilos"].isna().sum())
-    missing_area = int(data["Area"].isna().sum())
+    total_atipicos = int(cycles["Atipico"].sum())
+    st.metric("Total de ciclos detectados como atípicos (excluidos de modelos)", total_atipicos)
 
-    a, b, c = st.columns(3)
-    a.metric("Fechas no interpretables", invalid_dates)
-    b.metric("Kilos faltantes", missing_kilos)
-    c.metric("Áreas faltantes", missing_area)
-
-    st.write("### Reglas aplicadas")
-    st.write("• Fino y Extrafino se consolidan como Fino.")
-    st.write("• Cuando Cantidad V > 1, el área se divide entre Cantidad V.")
-    st.write("• La duración real se calcula por primera y última cosecha observada.")
-    st.write("• Los ciclos atípicos se identifican y se conservan para trazabilidad.")
-    st.write("• La recomendación da mayor peso a los datos recientes.")
-    st.write("• Las curvas se normalizan para sumar exactamente 100%.")
-
-    st.info(
-        "Próxima etapa: agregar Fecha de Siembra al histórico y conectar "
-        "el Plan con finca, lote, área, vegetal y semana de siembra."
-    )
+    st.write("### Criterio aplicado:")
+    st.write("• Se calculó el Rango Intercuartílico (IQR) de la duración real por vegetal.")
+    st.write("• Los ciclos con duraciones extremas (como los de 18 semanas) superan el umbral $Q3 + 1.5 \\times IQR$ y se marcan como `Atipico = True`.")
+    st.write("• Estos ciclos **ya no participan** en el cálculo de las medianas de rendimiento, las curvas porcentuales por semana relativa, ni en la estacionalidad.")
+    st.write("• Sin embargo, se mantienen visibles en la pestaña de cada vegetal para fines de auditoría y trazabilidad.")
