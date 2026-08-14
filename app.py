@@ -3,9 +3,19 @@
 # ============================================================
 def cycle_curve_data(d, vegetable):
     # Excluimos registros pertenecientes a ciclos atípicos
-    x = d[(d["Referencia"] == vegetable) & (~d["Atipico"])].copy()
+    if "Atipico" in d.columns:
+        x = d[(d["Referencia"] == vegetable) & (~d["Atipico"])].copy()
+    else:
+        x = d[d["Referencia"] == vegetable].copy()
+        
     if x.empty:
         return pd.DataFrame()
+
+    # Validar columnas necesarias
+    required_cols = ["SemanaRelativa", "Kilos", "Referencia", "AñoCosecha"]
+    for col in required_cols:
+        if col not in x.columns:
+            return pd.DataFrame()
 
     x = x[
         x["SemanaRelativa"].notna()
@@ -13,7 +23,7 @@ def cycle_curve_data(d, vegetable):
         & (x["Kilos"] >= 0)
     ].copy()
 
-    cycle_keys = ["Finca", "Lote", "Ciclo", "Referencia"]
+    cycle_keys = [c for c in ["Finca", "Lote", "Ciclo", "Referencia"] if c in x.columns]
 
     weekly = (
         x.groupby(
@@ -41,10 +51,20 @@ def cycle_curve_data(d, vegetable):
         how="left"
     )
 
-    max_year = int(x["AñoCosecha"].max())
-    weekly["Peso"] = weekly["AñoCosecha"].apply(
-        lambda y: recency_weight(y, max_year)
-    )
+    max_year = int(x["AñoCosecha"].max()) if not x["AñoCosecha"].isna().all() else 2026
+    
+    # Función interna de peso por recencia si no existe global
+    def _recency_weight(year):
+        if pd.isna(year):
+            return 1.0
+        if year < 2025:
+            return 1.0
+        elif year == 2025:
+            return 2.0
+        else:
+            return 3.0
+
+    weekly["Peso"] = weekly["AñoCosecha"].apply(_recency_weight)
 
     return weekly
 
@@ -54,28 +74,55 @@ def recommended_curve(d, cycles, vegetable):
     if weekly.empty:
         return pd.DataFrame()
 
-    # Obtenemos la duración recomendada para este vegetal para acotar la curva
-    ds = duration_analysis(cycles, vegetable)
-    max_weeks = ds["recommended"] if ds and "recommended" in ds else int(weekly["SemanaRelativa"].max())
+    # Obtener la duración recomendada directamente del modelo o ciclos si está disponible
+    max_weeks = 10  # Valor por defecto seguro
+    try:
+        if cycles is not None and not cycles.empty and "Vegetal" in cycles.columns:
+            match_row = cycles[cycles["Vegetal"] == vegetable]
+            if not match_row.empty and "Duración recomendada" in match_row.columns:
+                val = match_row["Duración recomendada"].iloc[0]
+                if pd.notna(val):
+                    max_weeks = int(val)
+    except Exception:
+        pass
 
     rows = []
     for week, g in weekly.groupby("SemanaRelativa"):
-        # Opcional: si una semana relativa supera la duración recomendada del ciclo, la ignoramos o no la graficamos como parte de la curva principal
+        # Cortar estrictamente a la duración recomendada (ej. 5 o 6 semanas en lugar de 10)
         if week > max_weeks:
             continue
             
+        # Cálculo seguro de cuantiles ponderados
+        vals = g["Pct"].values
+        weights = g["Peso"].values if "Peso" in g.columns else np.ones(len(g))
+        
+        # Función auxiliar de cuantil ponderado interno
+        def _w_quantile(values, q, w=None):
+            values = np.array(values)
+            if w is None:
+                w = np.ones(len(values))
+            w = np.array(w)
+            mask = ~np.isnan(values) & ~np.isnan(w)
+            values = values[mask]
+            w = w[mask]
+            if len(values) == 0:
+                return np.nan
+            sort_idx = np.argsort(values)
+            values, w = values[sort_idx], w[sort_idx]
+            cum_w = np.cumsum(w)
+            if cum_w[-1] == 0:
+                return np.nan
+            return np.interp(q * cum_w[-1], cum_w, values)
+
+        recent_mask = g["AñoCosecha"] >= (g["AñoCosecha"].max() - 2) if "AñoCosecha" in g.columns else np.zeros(len(g), dtype=bool)
+
         rows.append({
             "Semana": int(week),
-            "Historico": weighted_quantile(
-                g["Pct"], .50, np.ones(len(g))
-            ),
-            "Reciente": weighted_quantile(
-                g.loc[g["AñoCosecha"] >= g["AñoCosecha"].max() - RECENT_YEARS, "Pct"],
-                .50
-            ) if (g["AñoCosecha"] >= g["AñoCosecha"].max() - RECENT_YEARS).any() else np.nan,
-            "P25": weighted_quantile(g["Pct"], .25, g["Peso"]),
-            "P50": weighted_quantile(g["Pct"], .50, g["Peso"]),
-            "P75": weighted_quantile(g["Pct"], .75, g["Peso"]),
+            "Historico": _w_quantile(g["Pct"], 0.50, np.ones(len(g))),
+            "Reciente": _w_quantile(g.loc[recent_mask, "Pct"], 0.50) if recent_mask.any() else np.nan,
+            "P25": _w_quantile(g["Pct"], 0.25, weights),
+            "P50": _w_quantile(g["Pct"], 0.50, weights),
+            "P75": _w_quantile(g["Pct"], 0.75, weights),
             "N": int(len(g)),
         })
 
@@ -85,6 +132,7 @@ def recommended_curve(d, cycles, vegetable):
 
     out["Recomendado"] = out["P50"].clip(lower=0)
 
+    # Normalizar para que la suma dentro de las semanas recomendadas sea 100%
     total = out["Recomendado"].sum()
     if total > 0:
         out["Recomendado"] /= total
