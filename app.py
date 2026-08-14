@@ -63,8 +63,6 @@ def prepare_model(t6):
     cycles["DuracionReal"] = pd.to_numeric(duration.round(), errors="coerce")
     cycles["Rendimiento"] = cycles["TotalKilos"] / cycles["Area"].replace(0, np.nan)
 
-    max_year = int(d["Año"].max()) if not d["Año"].empty else 2026
-    
     # Clasificación por rangos temporales solicitados
     def get_periodo(y):
         if pd.isna(y): return "Histórico"
@@ -102,7 +100,7 @@ def build_necesidades_matrix(d, cycles, vegetable):
     # Pivotes para simular los rangos H2:K5 y H9:N12 de la pestaña necesidades
     pivot_curva = curva_periodo.pivot(index="PeriodoGrupo", columns="SemanaRelativa", values="PctCosecha").fillna(0)
 
-    # Rendimientos por semana y periodo (similar a E2:F55 / P2:S55)
+    # Rendimientos por semana y periodo
     rend_periodo = sub_cycles.groupby("PeriodoGrupo")["Rendimiento"].mean().to_dict()
 
     return pivot_curva, rend_periodo
@@ -130,7 +128,7 @@ try:
     
     data, cycles = prepare_model(left)
 except Exception as e:
-    st.error(fError al procesar el archivo: {e}")
+    st.error(f"Error al procesar el archivo: {e}")
     st.stop()
 
 vegetables = sorted(data["Referencia"].dropna().unique().tolist())
@@ -171,7 +169,6 @@ with tabs[1]:
     pivot_c, _ = build_necesidades_matrix(data, cycles, p_veg)
     
     if pivot_c is not None and not pivot_c.empty:
-        # Tomar por defecto la curva del periodo más reciente o recomendada
         periodo_ref = "2025 y 2026" if "2025 y 2026" in pivot_c.index else pivot_c.index[0]
         curva_vector = pivot_c.loc[periodo_ref]
         
