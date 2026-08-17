@@ -1,3 +1,4 @@
+
 import io
 from datetime import date, timedelta
 import numpy as np
@@ -80,10 +81,27 @@ def read_excel(file):
 
 def prepare_model(t6):
     d = t6.copy()
+    # Excel puede contener vacíos, NA, inf o textos en columnas numéricas.
+    # Convertimos de forma segura y usamos Int64 (admite NA).
+    for col in ["Area", "Ciclo", "Codigo", "CantidadV", "DuracionSC",
+                "Kilos", "Semana", "Año", "Mes"]:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+            d[col] = d[col].replace([np.inf, -np.inf], np.nan)
+
     d["CantidadV"] = d["CantidadV"].fillna(1).clip(lower=1)
     d["AreaEfectiva"] = d["Area"] / d["CantidadV"]
-    d["Semana"] = d["Semana"].astype(int)
-    d["Año"] = d["Año"].astype(int)
+
+    # Los registros sin semana o año válido no pueden entrar al cálculo ISO.
+    d = d[
+        d["Semana"].notna()
+        & d["Año"].notna()
+        & np.isfinite(d["Semana"])
+        & np.isfinite(d["Año"])
+    ].copy()
+
+    d["Semana"] = d["Semana"].round().astype("Int64")
+    d["Año"] = d["Año"].round().astype("Int64")
 
     # Fecha de lunes de la semana ISO. Esto permite cruzar años sin errores.
     d["SemanaInicio"] = pd.to_datetime(
@@ -108,7 +126,11 @@ def prepare_model(t6):
     )
     cycles["DuracionReal"] = (
         ((cycles["UltimaCosecha"] - cycles["PrimeraCosecha"]).dt.days / 7) + 1
-    ).round().astype(int)
+    ).round()
+    cycles["DuracionReal"] = cycles["DuracionReal"].where(
+        cycles["DuracionReal"].notna()
+        & np.isfinite(cycles["DuracionReal"])
+    ).astype("Int64")
     cycles["Rendimiento"] = cycles["TotalKilos"] / cycles["Area"].replace(0, np.nan)
 
     d = d.merge(
@@ -117,11 +139,21 @@ def prepare_model(t6):
     )
     d["SemanaRelativa"] = (
         ((d["SemanaInicio"] - d["PrimeraCosecha"]).dt.days / 7) + 1
-    ).round().astype(int)
+    ).round()
+    d["SemanaRelativa"] = d["SemanaRelativa"].where(
+        d["SemanaRelativa"].notna()
+        & np.isfinite(d["SemanaRelativa"])
+    ).astype("Int64")
 
     # Peso de recencia: 50% últimos 2 años, 30% 3-4 años, 20% anteriores.
-    max_year = int(d["Año"].max())
-    cycles["PesoRecencia"] = cycles["AñoCosecha"].apply(lambda y: recency_weight(y, max_year))
+    valid_years = pd.to_numeric(d["Año"], errors="coerce").dropna()
+    if valid_years.empty:
+        cycles["PesoRecencia"] = 1.0
+    else:
+        max_year = int(valid_years.max())
+        cycles["PesoRecencia"] = cycles["AñoCosecha"].apply(
+            lambda y: recency_weight(y, max_year)
+        )
 
     return d, cycles
 
@@ -146,7 +178,8 @@ def duration_analysis(cycles, vegetable):
     model_x = x[~x["AtipicoExtremo"]].copy()
     if len(model_x) < max(3, int(n * .50)):
         model_x = x.copy(); x["AtipicoExtremo"] = False
-    max_year = int(model_x["AñoCosecha"].max())
+    valid_years = pd.to_numeric(model_x["AñoCosecha"], errors="coerce").dropna()
+    max_year = int(valid_years.max()) if not valid_years.empty else 0
     recent = model_x[model_x["AñoCosecha"] >= max_year - 2].copy()
     m_all, m_recent = model_x["DuracionReal"].mode(), recent["DuracionReal"].mode()
     hist = int(m_all.iloc[0]) if len(m_all) else int(round(model_x["DuracionReal"].median()))
@@ -454,5 +487,3 @@ with tabs[4]:
         "Siguiente mejora recomendada: agregar Fecha de Siembra, Fecha de Primera Cosecha y variedad real. "
         "Con esas tres variables el modelo podrá aprender el tiempo siembra→cosecha y separar mejor efectos de lote, época y variedad."
     )
-
-
