@@ -1,6 +1,23 @@
 """
 Lógica del modelo estadístico de rendimientos y curva de cosecha.
 Compartida entre la app de Streamlit y el uso por línea de comandos.
+
+Metodología (nivel analista de datos):
+- Se excluye el primer y el último ciclo registrado de cada Finca-Lote:
+  el primer ciclo suele arrastrar captura incompleta de los primeros años
+  del sistema, y el último ciclo suele estar en curso (semanas de cosecha
+  aún no registradas). Ambos distorsionan curva y rendimiento si se dejan.
+- Tendencia: regresión robusta Theil-Sen (Rendimiento ~ Año de inicio de
+  cosecha) — no asume normalidad y es resistente a atípicos, por lo que no
+  requiere recortar (winsorizar) datos a mano.
+- Estacionalidad: se remueve la tendencia de cada ciclo (residuo), y se
+  suaviza por semana del año con un kernel circular (la semana 53 conecta
+  con la 1) ponderado por cercanía de semana y por recencia del año
+  (decaimiento exponencial) — así todos los años aportan, pero los
+  recientes pesan más, sin depender de un corte arbitrario entre "antes"
+  y "después".
+- Recomendado = tendencia proyectada al año objetivo + estacionalidad de
+  esa semana.
 """
 import io
 import numpy as np
@@ -18,35 +35,41 @@ thin = Side(style='thin', color='BFBFBF')
 BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
 
 
-def circular_smooth(serie_por_semana, window=3):
-    """Media móvil circular (semana 53 conecta con semana 1)."""
-    weeks = np.arange(1, 54)
-    arr = serie_por_semana.reindex(weeks).values.astype(float)
-    n = len(arr)
-    out = np.full(n, np.nan)
-    for i in range(n):
-        idxs = [(i + k) % n for k in range(-window, window + 1)]
-        w = arr[idxs]
-        w = w[~np.isnan(w)]
-        if len(w):
-            out[i] = w.mean()
-    return pd.Series(out, index=weeks)
-
-
-def cargar_datos(file_like, referencias_vegetal):
-    """file_like: ruta o objeto tipo archivo (ej. de st.file_uploader)."""
+# ---------------------------------------------------------------------------
+# Carga y limpieza
+# ---------------------------------------------------------------------------
+def cargar_tabla6(file_like):
     t6 = pd.read_excel(file_like, sheet_name='Hoja1', header=1, usecols="B:N", nrows=14084)
-    veg = t6[t6['Referencia'].isin(referencias_vegetal)].copy()
-    if veg.empty:
-        raise ValueError(
-            f"No se encontraron filas con Referencia en {referencias_vegetal}. "
-            f"Referencias disponibles: {sorted(t6['Referencia'].dropna().unique())}"
-        )
-    return veg
+    return t6
 
 
-def construir_ciclos(veg, anio_corte_periodo):
-    grp = veg.groupby(['Finca', 'Lote', 'Ciclo', 'Codigo'], as_index=False).agg(
+def marcar_ciclos_incompletos(t6):
+    """Marca el primer y último Ciclo de cada Finca-Lote como incompletos."""
+    rango = t6.groupby(['Finca', 'Lote'])['Ciclo'].agg(ciclo_min='min', ciclo_max='max')
+    t6 = t6.merge(rango, on=['Finca', 'Lote'])
+    t6['ciclo_incompleto'] = (t6['Ciclo'] == t6['ciclo_min']) | (t6['Ciclo'] == t6['ciclo_max'])
+    return t6.drop(columns=['ciclo_min', 'ciclo_max'])
+
+
+def opciones_disponibles(t6):
+    vegetales = sorted(t6['Referencia'].dropna().unique().tolist())
+    fincas = sorted(t6['Finca'].dropna().unique().tolist())
+    return vegetales, fincas
+
+
+# ---------------------------------------------------------------------------
+# Construcción de ciclos y cortes (a nivel Finca-Lote-Ciclo-Referencia)
+# ---------------------------------------------------------------------------
+def construir_ciclos(t6, referencias_vegetal, fincas=None, excluir_incompletos=True):
+    df = t6[t6['Referencia'].isin(referencias_vegetal)].copy()
+    if fincas:
+        df = df[df['Finca'].isin(fincas)]
+    if excluir_incompletos:
+        df = df[~df['ciclo_incompleto']]
+    if df.empty:
+        raise ValueError("No hay datos para esa combinación de vegetal/finca.")
+
+    grp = df.groupby(['Finca', 'Lote', 'Ciclo', 'Codigo'], as_index=False).agg(
         Kilos=('Kilos', 'sum'), Semana=('Semana', 'first'),
         Año=('Año', 'first'), Area=('Area', 'first'), CantidadV=('Cantidad V', 'first')
     )
@@ -60,72 +83,139 @@ def construir_ciclos(veg, anio_corte_periodo):
     cyc = cyc.merge(grp.groupby(['Finca', 'Lote', 'Ciclo'])['Kilos'].sum().rename('TotalKilos'),
                      on=['Finca', 'Lote', 'Ciclo'])
     cyc['Rendimiento'] = cyc['TotalKilos'] / (cyc['Area'] * cyc['CantidadV'])
-    cyc['periodo'] = np.where(cyc['AñoInicio'] < anio_corte_periodo, '<25', '25-26')
-
-    cortes = grp.merge(cyc[['Finca', 'Lote', 'Ciclo', 'periodo']], on=['Finca', 'Lote', 'Ciclo'])
+    cortes = grp.merge(cyc[['Finca', 'Lote', 'Ciclo']], on=['Finca', 'Lote', 'Ciclo'])
     return cyc, cortes
 
 
-def curva_de_cosecha(cortes, maxcorte, peso_reciente, peso_historico):
-    curva = {}
-    for periodo in ['<25', '25-26']:
-        sub = cortes[(cortes.periodo == periodo) & (cortes.corte <= maxcorte)]
-        agg = sub.groupby('corte')['pct'].mean().reindex(range(1, maxcorte + 1)).fillna(0)
-        total = agg.sum()
-        curva[periodo] = agg / total if total > 0 else agg
-    rec = curva['<25'] * peso_historico + curva['25-26'] * peso_reciente
-    total = rec.sum()
-    curva['rec'] = rec / total if total > 0 else rec
-    return curva
+# ---------------------------------------------------------------------------
+# Curva de cosecha por corte — global y por año
+# ---------------------------------------------------------------------------
+def curva_por_anio(cortes, maxcorte):
+    """% promedio por corte, para cada año de inicio de cosecha. Incluye N."""
+    sub = cortes[cortes.corte <= maxcorte].copy()
+    tabla = sub.pivot_table(index='corte', columns='Año', values='pct', aggfunc='mean')
+    tabla = tabla.reindex(range(1, maxcorte + 1))
+    tabla_norm = tabla.div(tabla.sum(axis=0), axis=1)
+    n_ciclos = sub.groupby('Año')['Ciclo'].nunique().reindex(tabla.columns)
+    return tabla_norm, n_ciclos
 
 
-def rendimiento_semanal(cyc, anio_objetivo, peso_reciente, peso_historico, winsor_pctl=(0.02, 0.98)):
-    lo, hi = cyc['Rendimiento'].quantile(list(winsor_pctl))
+def curva_recomendada(cortes, cyc, maxcorte, decay=0.85, anio_referencia=None):
+    """Curva ponderada por recencia (todos los años, decaimiento exponencial)."""
+    if anio_referencia is None:
+        anio_referencia = cyc['AñoInicio'].max()
+    sub = cortes[cortes.corte <= maxcorte].copy()
+    sub['peso'] = decay ** (anio_referencia - sub['Año'])
+    agg = sub.groupby('corte').apply(
+        lambda g: np.average(g['pct'], weights=g['peso'])
+    ).reindex(range(1, maxcorte + 1)).fillna(0)
+    return agg / agg.sum()
+
+
+# ---------------------------------------------------------------------------
+# Tendencia robusta + estacionalidad ponderada por recencia
+# ---------------------------------------------------------------------------
+def circular_week_distance(w1, w2, n=53):
+    d = np.abs(w1 - w2)
+    return np.minimum(d, n - d)
+
+
+def tendencia_robusta(cyc):
+    """Theil-Sen: robusto a atípicos, no requiere winsorizar a mano."""
+    slope, intercept, low, high = stats.theilslopes(cyc['Rendimiento'], cyc['AñoInicio'])
     cyc = cyc.copy()
-    cyc['Rend_w'] = cyc['Rendimiento'].clip(lo, hi)
-
-    slope, intercept, r, p, se = stats.linregress(cyc['AñoInicio'], cyc['Rend_w'])
     cyc['trend_pred'] = intercept + slope * cyc['AñoInicio']
-    cyc['resid'] = cyc['Rend_w'] - cyc['trend_pred']
-
-    semanal = {}
-    for periodo in ['<25', '25-26']:
-        wm = cyc[cyc.periodo == periodo].groupby('SemanaInicio')['Rend_w'].mean()
-        semanal[periodo] = circular_smooth(wm).interpolate(limit_direction='both')
-
-    resid_old = cyc[cyc.periodo == '<25'].groupby('SemanaInicio')['resid'].mean()
-    resid_new = cyc[cyc.periodo == '25-26'].groupby('SemanaInicio')['resid'].mean()
-    seas_old = circular_smooth(resid_old).interpolate(limit_direction='both')
-    seas_new = circular_smooth(resid_new).interpolate(limit_direction='both')
-    seasonal = peso_historico * seas_old + peso_reciente * seas_new
-
-    trend_target = intercept + slope * anio_objetivo
-    semanal['recomendado'] = (trend_target + seasonal).clip(lower=0)
-
-    trend_stats = {'slope': slope, 'intercept': intercept, 'p_value': p, 'r': r,
-                   'trend_target': trend_target, 'n_ciclos': len(cyc)}
-    return semanal, cyc, trend_stats
+    cyc['resid'] = cyc['Rendimiento'] - cyc['trend_pred']
+    return cyc, {'slope': slope, 'intercept': intercept, 'slope_low': low, 'slope_high': high}
 
 
-def ejecutar_modelo(file_like, nombre_vegetal='Ejote', referencias_vegetal=('Fino', 'Extrafino'),
-                     maxcorte=3, anio_corte_periodo=2025, anio_objetivo=2027,
-                     peso_reciente=0.65, peso_historico=0.35):
-    veg = cargar_datos(file_like, list(referencias_vegetal))
-    cyc, cortes = construir_ciclos(veg, anio_corte_periodo)
-    curva = curva_de_cosecha(cortes, maxcorte, peso_reciente, peso_historico)
-    semanal, cyc_full, trend_stats = rendimiento_semanal(
-        cyc, anio_objetivo, peso_reciente, peso_historico)
+def estacionalidad_kernel(cyc_con_resid, window=3, decay=0.85, anio_referencia=None):
+    """Estacionalidad semanal vía kernel circular (distancia de semana)
+    ponderado por recencia (decaimiento exponencial por año). Usa TODOS
+    los años disponibles, sin cortes arbitrarios entre periodos."""
+    if anio_referencia is None:
+        anio_referencia = cyc_con_resid['AñoInicio'].max()
+    recency_w = decay ** (anio_referencia - cyc_con_resid['AñoInicio'])
+    weeks_sem = cyc_con_resid['SemanaInicio'].values
+    resid = cyc_con_resid['resid'].values
+    recency_w = recency_w.values
+    out = {}
+    for w in range(1, 54):
+        dist = circular_week_distance(weeks_sem, w)
+        mask = dist <= window
+        if not mask.any():
+            out[w] = np.nan
+            continue
+        kernel_w = 1 - dist[mask] / (window + 1)
+        weight = kernel_w * recency_w[mask]
+        if weight.sum() <= 0:
+            out[w] = np.nan
+            continue
+        out[w] = np.average(resid[mask], weights=weight)
+    s = pd.Series(out).interpolate(limit_direction='both')
+    return s
+
+
+def rendimiento_real_por_semana_y_anio(cyc):
+    """Tabla real (sin suavizar): rendimiento promedio por semana y año."""
+    tabla = cyc.pivot_table(index='SemanaInicio', columns='AñoInicio', values='Rendimiento', aggfunc='mean')
+    tabla = tabla.reindex(range(1, 54))
+    n = cyc.pivot_table(index='SemanaInicio', columns='AñoInicio', values='Rendimiento', aggfunc='count')
+    n = n.reindex(range(1, 54))
+    return tabla, n
+
+
+def rendimiento_recomendado(cyc, anio_objetivo, decay=0.85, window=3):
+    cyc_r, trend_stats = tendencia_robusta(cyc)
+    seasonal = estacionalidad_kernel(cyc_r, window=window, decay=decay)
+    trend_target = trend_stats['intercept'] + trend_stats['slope'] * anio_objetivo
+    recomendado = (trend_target + seasonal).clip(lower=0)
+    trend_stats['trend_target'] = trend_target
+    trend_stats['n_ciclos'] = len(cyc)
+    # prueba de significancia de la tendencia (correlación robusta de rangos)
+    rho, p = stats.spearmanr(cyc['AñoInicio'], cyc['Rendimiento'])
+    trend_stats['spearman_rho'] = rho
+    trend_stats['p_value'] = p
+    return recomendado, cyc_r, trend_stats
+
+
+# ---------------------------------------------------------------------------
+# Orquestador
+# ---------------------------------------------------------------------------
+def ejecutar_modelo(t6, nombre_vegetal, referencias_vegetal, fincas=None,
+                     maxcorte=3, anio_objetivo=None, decay=0.85, window=3,
+                     excluir_incompletos=True):
+    t6m = marcar_ciclos_incompletos(t6)
+    cyc, cortes = construir_ciclos(t6m, referencias_vegetal, fincas, excluir_incompletos)
+    if anio_objetivo is None:
+        anio_objetivo = int(cyc['AñoInicio'].max()) + 1
+
+    curva_tabla, curva_n = curva_por_anio(cortes, maxcorte)
+    curva_rec = curva_recomendada(cortes, cyc, maxcorte, decay=decay, anio_referencia=cyc['AñoInicio'].max())
+
+    rend_real_tabla, rend_real_n = rendimiento_real_por_semana_y_anio(cyc)
+    rend_recomendado, cyc_con_resid, trend_stats = rendimiento_recomendado(
+        cyc, anio_objetivo, decay=decay, window=window)
+
+    mask_veg_finca = t6m['Referencia'].isin(referencias_vegetal)
+    if fincas:
+        mask_veg_finca &= t6m['Finca'].isin(fincas)
+    n_excluidos = int(t6m[mask_veg_finca]['ciclo_incompleto'].sum())
+
     return {
-        'nombre_vegetal': nombre_vegetal, 'curva': curva, 'semanal': semanal,
-        'cyc': cyc_full, 'cortes': cortes, 'trend_stats': trend_stats,
-        'maxcorte': maxcorte, 'anio_corte_periodo': anio_corte_periodo,
-        'anio_objetivo': anio_objetivo, 'n_old': int((cyc.periodo == '<25').sum()),
-        'n_new': int((cyc.periodo == '25-26').sum()),
+        'nombre_vegetal': nombre_vegetal, 'maxcorte': maxcorte, 'anio_objetivo': anio_objetivo,
+        'cyc': cyc_con_resid, 'cortes': cortes,
+        'curva_tabla': curva_tabla, 'curva_n': curva_n, 'curva_rec': curva_rec,
+        'rend_real_tabla': rend_real_tabla, 'rend_real_n': rend_real_n,
+        'rend_recomendado': rend_recomendado, 'trend_stats': trend_stats,
+        'n_ciclos': len(cyc), 'n_filas_excluidas_incompletas': n_excluidos,
+        'anios': sorted(cyc['AñoInicio'].unique().tolist()),
     }
 
 
 # ---------------------------------------------------------------------------
-# Generación del reporte Excel (mismo layout que la pestaña "necesidades")
+# Generación del reporte Excel (mismo layout que la pestaña "necesidades",
+# más hojas nuevas de curva y rendimiento por año)
 # ---------------------------------------------------------------------------
 def _styled(cell, value, header=False, sub=False, bold=False, numfmt=None):
     cell.value = value
@@ -140,10 +230,12 @@ def _styled(cell, value, header=False, sub=False, bold=False, numfmt=None):
 
 
 def generar_reporte_excel(resultado):
-    curva = resultado['curva']
-    semanal = resultado['semanal']
+    curva_rec = resultado['curva_rec']
+    rend_rec = resultado['rend_recomendado']
     maxcorte = resultado['maxcorte']
     nombre = resultado['nombre_vegetal']
+    curva_tabla = resultado['curva_tabla']
+    rend_real_tabla = resultado['rend_real_tabla']
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -154,7 +246,7 @@ def generar_reporte_excel(resultado):
     for i in range(maxcorte):
         wk = i + 1
         _styled(ws[f'B{3+i}'], wk)
-        _styled(ws[f'C{3+i}'], round(float(curva['rec'][wk]), 3), numfmt='0.0%')
+        _styled(ws[f'C{3+i}'], round(float(curva_rec[wk]), 3), numfmt='0.0%')
     total_row = 3 + maxcorte
     _styled(ws[f'B{total_row}'], 'Total', bold=True)
     ws[f'C{total_row}'] = f'=SUM(C3:C{total_row-1})'
@@ -162,47 +254,53 @@ def generar_reporte_excel(resultado):
     ws[f'C{total_row}'].font = Font(bold=True, name=FONT)
 
     _styled(ws['E2'], 'Semana', header=True)
-    _styled(ws['F2'], 'Rendimiento por semana', header=True)
+    _styled(ws['F2'], 'Rendimiento por semana (recomendado)', header=True)
     for wk in range(1, 54):
         r = 2 + wk
         _styled(ws[f'E{r}'], wk)
-        _styled(ws[f'F{r}'], round(float(semanal['recomendado'][wk])), numfmt='#,##0')
+        _styled(ws[f'F{r}'], round(float(rend_rec[wk])), numfmt='#,##0')
 
-    _styled(ws['H2'], f'{nombre} Rendimiento', header=True)
-    for j in range(maxcorte):
-        _styled(ws[f'{get_column_letter(9+j)}2'], f'Corte {j+1}', header=True)
-    rows = [('<25', '<25'), ('2025 y 2026', '25-26'), ('Curva recomendada', 'rec')]
-    for i, (label, key) in enumerate(rows):
-        r = 3 + i
-        _styled(ws[f'H{r}'], label, sub=True)
-        for j in range(maxcorte):
-            wk = j + 1
-            _styled(ws[f'{get_column_letter(9+j)}{r}'], round(float(curva[key][wk]), 3), numfmt='0.0%')
+    # Curva por año
+    ws2 = wb.create_sheet('Curva_por_Año')
+    _styled(ws2.cell(row=1, column=1), 'Corte', header=True)
+    for j, anio in enumerate(curva_tabla.columns):
+        _styled(ws2.cell(row=1, column=2+j), int(anio), header=True)
+    _styled(ws2.cell(row=1, column=2+len(curva_tabla.columns)), 'Recomendada', header=True)
+    for i, corte in enumerate(curva_tabla.index):
+        r = i + 2
+        _styled(ws2.cell(row=r, column=1), int(corte))
+        for j, anio in enumerate(curva_tabla.columns):
+            v = curva_tabla.iloc[i, j]
+            _styled(ws2.cell(row=r, column=2+j), None if pd.isna(v) else round(float(v), 3), numfmt='0.0%')
+        _styled(ws2.cell(row=r, column=2+len(curva_tabla.columns)), round(float(curva_rec[corte]), 3),
+                numfmt='0.0%', bold=True)
+    for col in range(1, 3+len(curva_tabla.columns)):
+        ws2.column_dimensions[get_column_letter(col)].width = 12
 
-    _styled(ws['P2'], 'Semana', header=True)
-    _styled(ws['Q2'], 'Rendimiento por semana <25', header=True)
-    _styled(ws['R2'], 'Rendimiento por semana 2025 y 2026', header=True)
-    _styled(ws['S2'], 'Rendimiento por semana recomendado', header=True)
-    for wk in range(1, 54):
-        r = 2 + wk
-        _styled(ws[f'P{r}'], wk)
-        _styled(ws[f'Q{r}'], round(float(semanal['<25'][wk])), numfmt='#,##0')
-        _styled(ws[f'R{r}'], round(float(semanal['25-26'][wk])), numfmt='#,##0')
-        _styled(ws[f'S{r}'], round(float(semanal['recomendado'][wk])), numfmt='#,##0')
+    # Rendimiento real por semana y año + recomendado
+    ws3 = wb.create_sheet('Rendimiento_por_Año')
+    _styled(ws3.cell(row=1, column=1), 'Semana', header=True)
+    for j, anio in enumerate(rend_real_tabla.columns):
+        _styled(ws3.cell(row=1, column=2+j), int(anio), header=True)
+    _styled(ws3.cell(row=1, column=2+len(rend_real_tabla.columns)), 'Recomendado', header=True)
+    for i, wk in enumerate(rend_real_tabla.index):
+        r = i + 2
+        _styled(ws3.cell(row=r, column=1), int(wk))
+        for j, anio in enumerate(rend_real_tabla.columns):
+            v = rend_real_tabla.iloc[i, j]
+            _styled(ws3.cell(row=r, column=2+j), None if pd.isna(v) else round(float(v)), numfmt='#,##0')
+        _styled(ws3.cell(row=r, column=2+len(rend_real_tabla.columns)), round(float(rend_rec[wk])),
+                numfmt='#,##0', bold=True)
+    for col in range(1, 3+len(rend_real_tabla.columns)):
+        ws3.column_dimensions[get_column_letter(col)].width = 12
 
-    for col, w in [('B', 14), ('C', 16), ('E', 9), ('F', 14), ('H', 16),
-                   ('P', 9), ('Q', 18), ('R', 20), ('S', 20)]:
-        ws.column_dimensions[col].width = w
-    for j in range(maxcorte):
-        ws.column_dimensions[get_column_letter(9+j)].width = 9
-
-    # Hoja de detalle de ciclos (auditoría)
+    # Detalle de ciclos (auditoría)
     cyc = resultado['cyc']
-    ws2 = wb.create_sheet('Ciclos_Detalle')
+    ws4 = wb.create_sheet('Ciclos_Detalle')
     cols = ['Finca', 'Lote', 'Ciclo', 'SemanaInicio', 'AñoInicio', 'Area', 'CantidadV',
-            'TotalKilos', 'Rendimiento', 'periodo']
+            'TotalKilos', 'Rendimiento']
     for i, h in enumerate(cols):
-        c = ws2.cell(row=1, column=i+1, value=h)
+        c = ws4.cell(row=1, column=i+1, value=h)
         c.font = Font(bold=True, color='FFFFFF', name=FONT)
         c.fill = H_FILL
     for i, row in cyc.reset_index(drop=True).iterrows():
@@ -213,14 +311,16 @@ def generar_reporte_excel(resultado):
                 v = int(v)
             elif col == 'Rendimiento':
                 v = round(float(v), 1)
-            ws2.cell(row=r, column=j+1, value=v)
+            ws4.cell(row=r, column=j+1, value=v)
     last_row = len(cyc) + 1
-    tab = Table(displayName="TablaCiclos", ref=f"A1:J{last_row}")
-    tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
-    ws2.add_table(tab)
-    ws2.freeze_panes = 'A2'
-    for col in ['A', 'B', 'J']:
-        ws2.column_dimensions[col].width = 12
+    if last_row > 1:
+        tab = Table(displayName="TablaCiclos", ref=f"A1:I{last_row}")
+        tab.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+        ws4.add_table(tab)
+    ws4.freeze_panes = 'A2'
+
+    for col, w in [('B', 14), ('C', 30), ('E', 9), ('F', 26)]:
+        ws.column_dimensions[col].width = w
 
     buf = io.BytesIO()
     wb.save(buf)
