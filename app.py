@@ -1,3 +1,4 @@
+
 import io
 from datetime import date, timedelta
 import numpy as np
@@ -454,4 +455,3 @@ with tabs[4]:
         "Siguiente mejora recomendada: agregar Fecha de Siembra, Fecha de Primera Cosecha y variedad real. "
         "Con esas tres variables el modelo podrá aprender el tiempo siembra→cosecha y separar mejor efectos de lote, época y variedad."
     )
-
