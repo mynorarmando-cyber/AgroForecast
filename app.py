@@ -234,9 +234,32 @@ def build_curve(d, vegetable):
     total = cyc.groupby(["Finca","Lote","Ciclo","Referencia"])["Kilos"].transform("sum")
     cyc["Pct"] = cyc["Kilos"] / total.replace(0, np.nan)
 
-    max_year = int(x["Año"].max())
-    cyc["Año"] = x.groupby(["Finca","Lote","Ciclo","Referencia"])["Año"].transform("max").values
-    cyc["Peso"] = cyc["Año"].apply(lambda y: recency_weight(y, max_year))
+    # Año del ciclo: calcularlo por ciclo y unir por las claves.
+    # No usamos .values porque el número de filas de x y cyc puede ser
+    # diferente después del groupby de SemanaRelativa.
+    year_by_cycle = (
+        x.groupby(
+            ["Finca", "Lote", "Ciclo", "Referencia"],
+            dropna=False,
+            as_index=False
+        )["Año"]
+        .max()
+        .rename(columns={"Año": "AñoCiclo"})
+    )
+
+    cyc = cyc.merge(
+        year_by_cycle,
+        on=["Finca", "Lote", "Ciclo", "Referencia"],
+        how="left"
+    )
+    cyc["Año"] = cyc["AñoCiclo"]
+    cyc = cyc.drop(columns=["AñoCiclo"], errors="ignore")
+
+    valid_years = pd.to_numeric(cyc["Año"], errors="coerce").dropna()
+    max_year = int(valid_years.max()) if not valid_years.empty else 0
+    cyc["Peso"] = cyc["Año"].apply(
+        lambda y: recency_weight(y, max_year) if pd.notna(y) else 1.0
+    )
 
     out = []
     for sw, g in cyc.groupby("SemanaRelativa"):
